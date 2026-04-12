@@ -143,7 +143,7 @@ func ResolveConfigPath() (string, error) {
 // Validate checks the resolved config for required fields.
 func (c Config) Validate() error {
 	if c.Token == "" {
-		return errors.New("PULSETIC_API_TOKEN is required")
+		return errors.New("PULSETIC_API_TOKEN environment variable is required\n  Get your token: https://app.pulsetic.com/settings/api\n  Then run: export PULSETIC_API_TOKEN=your_token")
 	}
 	if c.Output.Dir == "" {
 		return errors.New("output.dir is required")

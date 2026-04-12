@@ -171,7 +171,7 @@ func captureMonitorHistoryInteractive(ctx context.Context, rc *runCtx, monitorID
 func parseID(s string) (int64, error) {
 	id, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("invalid id %q", s)
+		return 0, fmt.Errorf("invalid id %q: must be a positive integer (e.g. 4172)", s)
 	}
 	return id, nil
 }

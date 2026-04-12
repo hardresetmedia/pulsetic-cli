@@ -18,23 +18,202 @@ cd pulsetic-cli
 go build -o pulsetic-cli ./cmd/pulsetic-cli
 ```
 
-## Quick start
+## User quickstart
+
+A step-by-step walkthrough to go from zero to a verified audit log.
+
+### 1. Get your API token
+
+Log in to Pulsetic and go to **Settings > API** (https://app.pulsetic.com/settings/api). Copy your token.
+
+### 2. Export it
 
 ```bash
-# Set your API token (get it from https://app.pulsetic.com/settings/api)
 export PULSETIC_API_TOKEN=your_token_here
+```
 
-# Capture a full audit snapshot (all monitors, status pages, domains, heartbeats)
-pulsetic-cli snapshot
+### 3. Run your first snapshot
 
-# Verify the audit log hasn't been tampered with
+```bash
+pulsetic-cli snapshot --since=1h
+```
+
+You'll see progress output like:
+
+```
+snapshot: 2026-04-12 13:00:00 to 2026-04-12 14:00:00
+snapshot: 5 monitors found
+  monitor 1/5 (id=115988)
+  monitor 2/5 (id=116008)
+  ...
+snapshot: 2 status pages found
+667 records -> ./audit/pulsetic-2026-04.jsonl
+```
+
+### 4. Verify the chain
+
+```bash
 pulsetic-cli verify
+```
 
-# Query specific resources
-pulsetic-cli monitors list
-pulsetic-cli monitors history 4172 --since=7d
-pulsetic-cli domains list
-pulsetic-cli heartbeats list
+Expected output:
+
+```
+chain OK: 667 records, last_hash=b561e244...
+```
+
+### 5. Set up a daily cron job
+
+```bash
+# Nightly at 2am UTC
+0 2 * * * PULSETIC_API_TOKEN=your_token /usr/local/bin/pulsetic-cli snapshot --output=/var/audit/pulsetic
+```
+
+### 6. Investigate a specific monitor
+
+```bash
+# Find the monitor ID
+pulsetic-cli monitors list --dry-run | grep nsworkplaceeducation
+# id=141455
+
+# Get its full detail
+pulsetic-cli monitors get 141455 --dry-run
+
+# Pull 7 days of uptime history
+pulsetic-cli monitors history 141455 --since=7d
+
+# Check who gets alerts
+pulsetic-cli notifs list 141455 --dry-run
+```
+
+### 7. Use --dry-run for exploration
+
+`--dry-run` prints API responses to stdout without writing audit records. Use it for exploring data before committing to the audit log:
+
+```bash
+pulsetic-cli status-pages list --dry-run
+pulsetic-cli domains list --dry-run
+pulsetic-cli heartbeats list --dry-run
+```
+
+### 8. Use --verbose for debugging
+
+Add `-v` to see every API call with timing:
+
+```bash
+pulsetic-cli snapshot --since=1h -v
+```
+
+```
+[API] GET /monitors?page=1&per_page=100
+[API] 200 (142ms, 48832B)
+[API] GET /monitors/115988/snapshots?start_dt=2026-04-12+13:00:00&end_dt=2026-04-12+14:00:00&page=1&per_page=100
+[API] 200 (89ms, 9216B)
+...
+```
+
+---
+
+## Developer quickstart
+
+For building, testing, and contributing to pulsetic-cli.
+
+### 1. Clone and build
+
+```bash
+git clone https://github.com/program-the-brain-not-the-heartbeat/pulsetic-cli.git
+cd pulsetic-cli
+go build -o pulsetic-cli ./cmd/pulsetic-cli
+./pulsetic-cli --help
+```
+
+### 2. Run the test suite
+
+```bash
+go test ./...
+```
+
+Expected output (97 tests across 4 packages):
+
+```
+ok   .../internal/audit     0.026s
+ok   .../internal/cli       0.070s
+ok   .../internal/config    0.003s
+ok   .../internal/pulsetic  0.027s
+```
+
+Run with the race detector:
+
+```bash
+go test -race ./...
+```
+
+### 3. Project structure
+
+```
+cmd/pulsetic-cli/main.go     Entrypoint, signal handling, version stamp
+internal/
+  cli/                        Cobra command tree (one file per resource)
+    root.go                   Root cmd, global flags, runCtx, callAndRecord
+    snapshot.go               Snapshot algorithm, pagination, progress
+    monitors.go               monitors list/get/create/update/delete/history
+    statuspages.go            Status pages + maintenance + incidents CRUD
+    domains.go                Domains CRUD
+    heartbeats.go             Heartbeats CRUD
+    notifications.go          Notification channels (7 types)
+    incidents.go              Cross-page incident listing
+    verify.go                 Chain verification command
+  pulsetic/
+    client.go                 HTTP client: auth, retry, backoff, body support
+    types.go                  Minimal ID extraction for pagination control flow
+  audit/
+    record.go                 Record struct, canonical JSON, SHA-256 hashing
+    writer.go                 Append-only JSONL writer with chain state
+    verify.go                 Chain replay and break detection
+  config/
+    config.go                 TOML file + env var + defaults loading
+```
+
+### 4. How tests work
+
+- **audit package**: Golden hash chain tests, tamper detection, resume-after-restart, map ordering stability
+- **pulsetic package**: `httptest.NewServer` for auth headers, retry/backoff, POST body re-send, response parsing
+- **config package**: Env var override precedence, TOML parsing, output path interpolation
+- **cli package**: Two fake server types:
+  - `fakePulsetic` (snapshot_test.go) - realistic paginated responses for full snapshot E2E
+  - `crudServer` (e2e_test.go) - catch-all echo server for verifying method/path/body of every CRUD command
+
+### 5. Adding a new subcommand
+
+Follow the pattern in `domains.go` (simplest CRUD example):
+
+1. Create `internal/cli/newresource.go`
+2. Define `func newResourceCmd(opts *globalOpts, version string) *cobra.Command`
+3. Add list/get/create/update/delete subcommands - each calls `opts.prepare()`, defers `rc.close()`, and calls `rc.callAndRecord()` or `rc.callAndRecordWithBody()`
+4. Add `Example:` fields with copy-pasteable commands
+5. Wire it into `root.go`: `root.AddCommand(newResourceCmd(opts, version))`
+6. Add E2E tests in `e2e_test.go` using `runCmdDryRun` helper
+7. Run `go test ./...`
+
+### 6. Manual testing against the live API
+
+```bash
+export PULSETIC_API_TOKEN=your_token
+
+# Quick smoke test - list monitors in dry-run
+./pulsetic-cli monitors list --dry-run
+
+# Full snapshot to a temp dir
+./pulsetic-cli snapshot --since=1h --output=/tmp/pulsetic-test
+
+# Verify the chain
+./pulsetic-cli verify /tmp/pulsetic-test/pulsetic-2026-04.jsonl
+
+# Tamper detection test
+cp /tmp/pulsetic-test/pulsetic-2026-04.jsonl /tmp/tamper-test.jsonl
+# Edit a byte in /tmp/tamper-test.jsonl
+./pulsetic-cli verify /tmp/tamper-test.jsonl
+# Expected: exit code 3, "chain broken at seq=..."
 ```
 
 ## Configuration
