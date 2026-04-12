@@ -51,7 +51,7 @@ func newSnapshotCmd(opts *globalOpts, version string) *cobra.Command {
 }
 
 func runSnapshot(ctx context.Context, rc *runCtx) error {
-	fmt.Fprintf(os.Stderr, "snapshot: %s to %s\n",
+	rc.logStderr("snapshot: %s to %s\n",
 		formatPulseticTime(rc.start), formatPulseticTime(rc.end))
 
 	// 1. Monitors + per-monitor history.
@@ -59,9 +59,9 @@ func runSnapshot(ctx context.Context, rc *runCtx) error {
 	if err != nil {
 		return fmt.Errorf("list monitors: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "snapshot: %d monitors found\n", len(monitorIDs))
+	rc.logStderr("snapshot: %d monitors found\n", len(monitorIDs))
 	for i, id := range monitorIDs {
-		fmt.Fprintf(os.Stderr, "  monitor %d/%d (id=%d)\n", i+1, len(monitorIDs), id)
+		rc.logStderr("  monitor %d/%d (id=%d)\n", i+1, len(monitorIDs), id)
 		if err := captureMonitorHistory(ctx, rc, id, "snapshot.monitors"); err != nil {
 			return fmt.Errorf("monitor %d: %w", id, err)
 		}
@@ -72,7 +72,7 @@ func runSnapshot(ctx context.Context, rc *runCtx) error {
 	if err != nil {
 		return fmt.Errorf("list status pages: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "snapshot: %d status pages found\n", len(pageIDs))
+	rc.logStderr("snapshot: %d status pages found\n", len(pageIDs))
 	for _, id := range pageIDs {
 		if err := captureStatusPage(ctx, rc, id, "snapshot.status_pages"); err != nil {
 			return fmt.Errorf("status page %d: %w", id, err)

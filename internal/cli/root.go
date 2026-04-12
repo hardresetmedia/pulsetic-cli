@@ -27,6 +27,8 @@ type globalOpts struct {
 	outputDir  string
 	dryRun     bool
 	verbose    bool
+	jsonOutput bool
+	quiet      bool
 	since      string
 	until      string
 }
@@ -72,6 +74,8 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().StringVar(&opts.outputDir, "output", "", "override output directory for audit records")
 	root.PersistentFlags().BoolVar(&opts.dryRun, "dry-run", false, "print API responses to stdout, do not write audit records")
 	root.PersistentFlags().BoolVarP(&opts.verbose, "verbose", "v", false, "log each API call to stderr")
+	root.PersistentFlags().BoolVar(&opts.jsonOutput, "json", false, "emit structured JSON envelope to stdout")
+	root.PersistentFlags().BoolVarP(&opts.quiet, "quiet", "q", false, "suppress all stderr progress output")
 	root.PersistentFlags().StringVar(&opts.since, "since", "", "time range start (e.g. 24h, 7d, or RFC3339)")
 	root.PersistentFlags().StringVar(&opts.until, "until", "", "time range end (default: now)")
 
@@ -87,6 +91,15 @@ func NewRootCmd(version string) *cobra.Command {
 	return root
 }
 
+// jsonEnvelope is the structured output emitted to stdout when --json is set.
+type jsonEnvelope struct {
+	OK      bool              `json:"ok"`
+	Command string            `json:"command,omitempty"`
+	Records int               `json:"records"`
+	Data    []json.RawMessage `json:"data,omitempty"`
+	Error   string            `json:"error,omitempty"`
+}
+
 // runCtx is the per-invocation state passed through each subcommand.
 type runCtx struct {
 	cfg        config.Config
@@ -96,8 +109,12 @@ type runCtx struct {
 	dryRun     bool
 	dryRunOut  io.Writer // where dry-run prints; defaults to os.Stdout
 	verbose    bool
+	jsonOutput bool
+	quiet      bool
 	records    int    // count of records written (for summary)
 	outputPath string // resolved audit file path (for summary)
+	lastCmd    string // most recent command name (for envelope)
+	jsonData   []json.RawMessage // collected response bodies for --json
 	start      time.Time
 	end        time.Time
 	now        time.Time
@@ -154,15 +171,17 @@ func (o *globalOpts) prepare(version string, dryOut io.Writer) (*runCtx, error) 
 
 	host, _ := os.Hostname()
 	rc := &runCtx{
-		cfg:       cfg,
-		client:    client,
-		actor:     audit.Actor{Tool: "pulsetic-cli", Version: version, Host: host},
-		dryRun:    o.dryRun,
-		dryRunOut: dryOut,
-		verbose:   o.verbose,
-		start:     start,
-		end:       end,
-		now:       now,
+		cfg:        cfg,
+		client:     client,
+		actor:      audit.Actor{Tool: "pulsetic-cli", Version: version, Host: host},
+		dryRun:     o.dryRun,
+		dryRunOut:  dryOut,
+		verbose:    o.verbose && !o.quiet,
+		jsonOutput: o.jsonOutput,
+		quiet:      o.quiet,
+		start:      start,
+		end:        end,
+		now:        now,
 	}
 
 	if !o.dryRun {
@@ -180,14 +199,30 @@ func (o *globalOpts) prepare(version string, dryOut io.Writer) (*runCtx, error) 
 
 // record writes one Call to the audit log. In --dry-run mode it prints
 // the raw response body to the configured dryRunOut writer instead.
+// When --json is active, response bodies are collected for the envelope.
 func (rc *runCtx) record(command string, call *pulsetic.Call) error {
-	if rc.writer == nil {
-		out := rc.dryRunOut
-		if out == nil {
-			out = os.Stdout
+	rc.lastCmd = command
+
+	// Collect response body for --json envelope.
+	if rc.jsonOutput {
+		body := json.RawMessage(call.Body)
+		if len(body) == 0 {
+			body = json.RawMessage("null")
 		}
-		_, err := fmt.Fprintln(out, string(call.Body))
-		return err
+		rc.jsonData = append(rc.jsonData, body)
+	}
+
+	if rc.writer == nil {
+		// Dry-run: print raw JSON to stdout unless --json handles it.
+		if !rc.jsonOutput {
+			out := rc.dryRunOut
+			if out == nil {
+				out = os.Stdout
+			}
+			_, err := fmt.Fprintln(out, string(call.Body))
+			return err
+		}
+		return nil
 	}
 	// Normalize nil query map to empty so canonical JSON is always "query:{}"
 	// rather than sometimes "query:null". Without this, the same logical
@@ -259,16 +294,69 @@ func (rc *runCtx) callAndRecordWithBody(ctx context.Context, command, method, pa
 	return call, nil
 }
 
+// logStderr prints to stderr unless --quiet is set.
+func (rc *runCtx) logStderr(format string, args ...any) {
+	if !rc.quiet {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+}
+
 func (rc *runCtx) close() error {
-	if rc.records > 0 && !rc.dryRun && rc.outputPath != "" {
-		fmt.Fprintf(os.Stderr, "%d records -> %s\n", rc.records, rc.outputPath)
-	} else if rc.records > 0 && rc.dryRun {
-		fmt.Fprintf(os.Stderr, "%d records (dry-run, not written)\n", rc.records)
+	// Emit JSON envelope if --json is active.
+	if rc.jsonOutput {
+		out := rc.dryRunOut
+		if out == nil {
+			out = os.Stdout
+		}
+		env := jsonEnvelope{
+			OK:      true,
+			Command: rc.lastCmd,
+			Records: rc.records,
+			Data:    rc.jsonData,
+		}
+		enc := json.NewEncoder(out)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(env); err != nil {
+			return fmt.Errorf("json output: %w", err)
+		}
+	}
+
+	if !rc.quiet {
+		if rc.records > 0 && !rc.dryRun && rc.outputPath != "" {
+			fmt.Fprintf(os.Stderr, "%d records -> %s\n", rc.records, rc.outputPath)
+		} else if rc.records > 0 && rc.dryRun {
+			fmt.Fprintf(os.Stderr, "%d records (dry-run, not written)\n", rc.records)
+		}
 	}
 	if rc.writer == nil {
 		return nil
 	}
 	return rc.writer.Close()
+}
+
+// closeWithError emits a JSON error envelope (for --json mode) and
+// closes the writer. Used by commands that want to report errors
+// in the JSON output instead of only via the exit code.
+func (rc *runCtx) closeWithError(cmdErr error) error {
+	if rc.jsonOutput && cmdErr != nil {
+		out := rc.dryRunOut
+		if out == nil {
+			out = os.Stdout
+		}
+		env := jsonEnvelope{
+			OK:      false,
+			Command: rc.lastCmd,
+			Records: rc.records,
+			Error:   cmdErr.Error(),
+		}
+		enc := json.NewEncoder(out)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(env)
+	}
+	if rc.writer != nil {
+		return rc.writer.Close()
+	}
+	return nil
 }
 
 // parseRelativeTime parses one of: "now", a Go duration ("24h"), an

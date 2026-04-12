@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -34,11 +35,36 @@ func newVerifyCmd(opts *globalOpts) *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			out := c.OutOrStdout()
+
+			if opts.jsonOutput {
+				v := map[string]any{
+					"ok":        res.OK(),
+					"records":   res.Records,
+					"last_hash": res.LastHash,
+				}
+				if !res.OK() {
+					v["broken_at"] = res.BrokenAt
+					v["broken_line"] = res.BrokenLine
+					v["reason"] = res.Reason
+				}
+				enc := json.NewEncoder(out)
+				enc.SetEscapeHTML(false)
+				if err := enc.Encode(v); err != nil {
+					return err
+				}
+				if !res.OK() {
+					os.Exit(verifyExitCode)
+				}
+				return nil
+			}
+
 			if !res.OK() {
 				fmt.Fprintf(c.ErrOrStderr(), "chain broken at seq=%d line=%d: %s\n", res.BrokenAt, res.BrokenLine, res.Reason)
 				os.Exit(verifyExitCode)
 			}
-			fmt.Fprintf(c.OutOrStdout(), "chain OK: %d records, last_hash=%s\n", res.Records, res.LastHash)
+			fmt.Fprintf(out, "chain OK: %d records, last_hash=%s\n", res.Records, res.LastHash)
 			return nil
 		},
 	}

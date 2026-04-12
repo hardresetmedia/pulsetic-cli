@@ -151,6 +151,40 @@ func runCmdDryRun(t *testing.T, srv *crudServer, args ...string) (string, error)
 	return runCmd(t, srv, append(args, "--dry-run")...)
 }
 
+// cmdResult holds separated stdout and stderr for precise output assertions.
+type cmdResult struct {
+	Stdout string
+	Stderr string
+}
+
+// runCmdSplit is like runCmd but captures stdout and stderr separately.
+func runCmdSplit(t *testing.T, srv *crudServer, args ...string) (cmdResult, error) {
+	t.Helper()
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "audit")
+
+	t.Setenv("PULSETIC_CLI_OUTPUT_DIR", "")
+	t.Setenv("PULSETIC_CLI_SINCE", "")
+	t.Setenv("PULSETIC_CLI_BASE_URL", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("PULSETIC_API_TOKEN", "test-token")
+	t.Setenv("PULSETIC_CLI_BASE_URL", srv.URL+"/api/public")
+	t.Setenv("HOME", dir)
+
+	root := NewRootCmd("test")
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+
+	fullArgs := append(args, "--output", outDir, "--since", "1h")
+	root.SetArgs(fullArgs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := root.ExecuteContext(ctx)
+	return cmdResult{Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
 // assertLastMethod checks the most recent request to the fake server.
 func assertLastMethod(t *testing.T, srv *crudServer, wantMethod, wantPathSuffix string) {
 	t.Helper()
@@ -822,5 +856,181 @@ func TestAuthTokenSentWithoutBearerPrefix(t *testing.T) {
 		if r.Auth != "test-token" {
 			t.Fatalf("auth header should be raw token %q, got %q", "test-token", r.Auth)
 		}
+	}
+}
+
+// ---------- --json flag ----------
+
+func TestJSONFlagMonitorsList(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--json", "--dry-run")
+	if err != nil {
+		t.Fatalf("monitors list --json: %v", err)
+	}
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(res.Stdout), &env); err != nil {
+		t.Fatalf("parse JSON envelope: %v\nstdout: %s", err, res.Stdout)
+	}
+	if !env.OK {
+		t.Fatalf("expected ok=true, got: %+v", env)
+	}
+	if env.Records < 1 {
+		t.Fatalf("expected at least 1 record, got %d", env.Records)
+	}
+	if len(env.Data) < 1 {
+		t.Fatalf("expected at least 1 data entry, got %d", len(env.Data))
+	}
+	// Data should contain parseable JSON.
+	var item map[string]any
+	if err := json.Unmarshal(env.Data[0], &item); err != nil {
+		t.Fatalf("data[0] not valid JSON: %v", err)
+	}
+}
+
+func TestJSONFlagMonitorsCreate(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "create",
+		"--data", `{"urls":["https://example.com"]}`, "--json", "--dry-run")
+	if err != nil {
+		t.Fatalf("monitors create --json: %v", err)
+	}
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(res.Stdout), &env); err != nil {
+		t.Fatalf("parse: %v\nstdout: %s", err, res.Stdout)
+	}
+	if !env.OK {
+		t.Fatal("expected ok=true")
+	}
+	if env.Records != 1 {
+		t.Fatalf("expected 1 record, got %d", env.Records)
+	}
+	if env.Command != "monitors.create" {
+		t.Fatalf("command: want monitors.create, got %q", env.Command)
+	}
+}
+
+func TestJSONFlagDoesNotPrintRawBodyToStdout(t *testing.T) {
+	// With --json, dry-run should NOT print raw JSON bodies line by line.
+	// Only the final envelope should appear on stdout.
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--json", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stdout should be a single JSON object (the envelope), not multiple lines.
+	lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line (envelope), got %d lines:\n%s", len(lines), res.Stdout)
+	}
+}
+
+func TestJSONFlagVerifyOK(t *testing.T) {
+	// Create a valid audit file, then verify with --json.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.jsonl")
+	w, err := audit.OpenWriter(path, audit.Actor{Tool: "t", Version: "0", Host: "h"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := audit.Request{Method: "GET", Path: "/test", Query: map[string]string{}}
+	resp := audit.Response{Status: 200, DurationMS: 1, BodySHA256: "x", Body: json.RawMessage(`{}`)}
+	if _, err := w.Append("t", req, resp); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	root := NewRootCmd("test")
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"verify", path, "--json"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var v map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &v); err != nil {
+		t.Fatalf("parse: %v\nstdout: %s", err, stdout.String())
+	}
+	if v["ok"] != true {
+		t.Fatalf("expected ok=true: %v", v)
+	}
+	if v["records"].(float64) != 1 {
+		t.Fatalf("expected 1 record: %v", v)
+	}
+}
+
+// ---------- --quiet flag ----------
+
+func TestQuietFlagSuppressesStderrProgress(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--quiet")
+	if err != nil {
+		t.Fatalf("monitors list --quiet: %v", err)
+	}
+	// Stderr should have no progress or summary output.
+	if res.Stderr != "" {
+		t.Fatalf("--quiet should suppress stderr, got: %q", res.Stderr)
+	}
+}
+
+func TestQuietAndJSONTogether(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--json", "--quiet", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stderr should be empty.
+	if res.Stderr != "" {
+		t.Fatalf("--quiet should suppress stderr, got: %q", res.Stderr)
+	}
+	// Stdout should have the JSON envelope.
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(res.Stdout), &env); err != nil {
+		t.Fatalf("parse: %v\nstdout: %s", err, res.Stdout)
+	}
+	if !env.OK {
+		t.Fatal("expected ok=true")
+	}
+}
+
+// ---------- --json pipeline patterns ----------
+
+func TestJSONOutputIsPipelineCompatible(t *testing.T) {
+	// Verifies the envelope can be piped to jq-style extraction:
+	// pulsetic-cli monitors list --json | jq '.data[0]'
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "domains", "list", "--json", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(res.Stdout), &env); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate jq '.data[0].data[0].domain' - the envelope's data holds
+	// full API responses, each of which has its own "data" array.
+	if len(env.Data) < 1 {
+		t.Fatal("expected at least 1 data item")
+	}
+	// Parse the first API response page.
+	var page map[string]any
+	if err := json.Unmarshal(env.Data[0], &page); err != nil {
+		t.Fatalf("data[0] not parseable: %v", err)
+	}
+	items, ok := page["data"].([]any)
+	if !ok || len(items) < 1 {
+		t.Fatalf("expected inner data array, got: %v", page)
+	}
+	domain, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected object, got: %v", items[0])
+	}
+	if domain["domain"] != "example.com" {
+		t.Fatalf("expected example.com, got %v", domain["domain"])
 	}
 }

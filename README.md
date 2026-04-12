@@ -621,6 +621,94 @@ echo '{"urls": ["https://example.com"]}' | pulsetic-cli monitors create --data -
 pulsetic-cli monitors create --data - < monitor.json
 ```
 
+## Scripting and automation
+
+### --json flag
+
+Add `--json` to any command to get a structured JSON envelope on stdout:
+
+```bash
+pulsetic-cli monitors list --json --dry-run
+```
+
+```json
+{"ok":true,"command":"monitors.list","records":2,"data":[{"data":[{"id":1,"url":"https://example.com"},{"id":2,"url":"https://api.example.com"}]}]}
+```
+
+The envelope always has `ok`, `command`, `records`, and `data` (array of raw API response bodies). On error, `ok` is `false` and `error` contains the message.
+
+Verify also supports `--json`:
+
+```bash
+pulsetic-cli verify --json
+```
+
+```json
+{"ok":true,"records":667,"last_hash":"b561e244..."}
+```
+
+### --quiet flag
+
+Suppress all stderr progress output. Only the exit code matters:
+
+```bash
+pulsetic-cli snapshot --quiet && echo "OK" || echo "FAILED"
+```
+
+Combine with `--json` for fully machine-readable operation:
+
+```bash
+pulsetic-cli monitors list --json --quiet | jq '.data[0].data[].id'
+```
+
+### jq recipes
+
+```bash
+# Get all monitor IDs
+pulsetic-cli monitors list --json -q | jq '.data[0].data[].id'
+
+# Get monitor URLs and statuses
+pulsetic-cli monitors list --json -q | jq '.data[].data[] | {id, url, status}'
+
+# Snapshot then verify in one line
+pulsetic-cli snapshot -q && pulsetic-cli verify -q
+
+# Get history for every monitor (scripted loop)
+pulsetic-cli monitors list --json -q | jq -r '.data[].data[].id' | while read id; do
+  pulsetic-cli monitors history "$id" --since=7d -q
+done
+
+# Query the audit log directly with jq
+jq 'select(.command == "snapshot.monitors.stats") | .response.body' audit/pulsetic-2026-04.jsonl
+
+# Find all failed API calls in the audit log
+jq 'select(.response.status >= 400) | {seq, command, status: .response.status}' audit/pulsetic-2026-04.jsonl
+
+# Count records per command type
+jq -s 'group_by(.command) | map({command: .[0].command, count: length})' audit/pulsetic-2026-04.jsonl
+
+# Check if any monitor had downtime today
+jq 'select(.command | endswith(".stats")) | select(.response.body."1day".downtime > 0) | .request.path' audit/pulsetic-2026-04.jsonl
+
+# Extract notification channels across all monitors
+jq 'select(.command | endswith(".notification_channels")) | .response.body[] | {monitor: .monitor_id, via, email}' audit/pulsetic-2026-04.jsonl
+```
+
+### CI/CD integration
+
+```bash
+# Run snapshot and fail the pipeline if chain is broken
+pulsetic-cli snapshot --quiet
+pulsetic-cli verify --json --quiet | jq -e '.ok' > /dev/null
+
+# Alert on HTTP errors in the audit log
+ERRORS=$(jq -s '[.[] | select(.response.status >= 400)] | length' audit/pulsetic-2026-04.jsonl)
+if [ "$ERRORS" -gt 0 ]; then
+  echo "$ERRORS API errors found in audit log"
+  exit 1
+fi
+```
+
 ## Exit codes
 
 | Code | Meaning |
