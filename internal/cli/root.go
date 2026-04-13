@@ -4,13 +4,17 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -22,12 +26,22 @@ import (
 
 // globalOpts holds the values of persistent flags. A pointer is passed
 // to each subcommand constructor so they share the same storage.
+// outputFormat controls how API response data is printed to stdout.
+const (
+	formatJSONL  = "jsonl"  // one JSON object per line (default)
+	formatJSON   = "json"   // structured envelope
+	formatCSV    = "csv"    // flattened CSV rows
+	formatStdout = "stdout" // pretty-printed raw response
+)
+
 type globalOpts struct {
 	configPath string
 	outputDir  string
+	format     string
+	filter     string
 	dryRun     bool
 	verbose    bool
-	jsonOutput bool
+	jsonOutput bool // shorthand for --format=json
 	quiet      bool
 	since      string
 	until      string
@@ -74,8 +88,10 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().StringVar(&opts.outputDir, "output", "", "override output directory for audit records")
 	root.PersistentFlags().BoolVar(&opts.dryRun, "dry-run", false, "print API responses to stdout, do not write audit records")
 	root.PersistentFlags().BoolVarP(&opts.verbose, "verbose", "v", false, "log each API call to stderr")
-	root.PersistentFlags().BoolVar(&opts.jsonOutput, "json", false, "emit structured JSON envelope to stdout")
+	root.PersistentFlags().StringVar(&opts.format, "format", "jsonl", "output format: jsonl, json, csv, stdout")
+	root.PersistentFlags().BoolVar(&opts.jsonOutput, "json", false, "shorthand for --format=json")
 	root.PersistentFlags().BoolVarP(&opts.quiet, "quiet", "q", false, "suppress all stderr progress output")
+	root.PersistentFlags().StringVar(&opts.filter, "filter", "", "filter list output by name/url/status substring (case-insensitive)")
 	root.PersistentFlags().StringVar(&opts.since, "since", "", "time range start (e.g. 24h, 7d, or RFC3339)")
 	root.PersistentFlags().StringVar(&opts.until, "until", "", "time range end (default: now)")
 
@@ -87,6 +103,10 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newHeartbeatsCmd(opts, version))
 	root.AddCommand(newNotificationChannelsCmd(opts, version))
 	root.AddCommand(newVerifyCmd(opts))
+	root.AddCommand(newInitCmd(opts))
+	root.AddCommand(newTestCmd(opts, version))
+	root.AddCommand(newStatusCmd(opts, version))
+	root.AddCommand(newLogCmd(opts))
 
 	return root
 }
@@ -101,20 +121,23 @@ type jsonEnvelope struct {
 }
 
 // runCtx is the per-invocation state passed through each subcommand.
+// The mu mutex protects fields that are modified during concurrent
+// snapshot execution (records, lastCmd, collected).
 type runCtx struct {
+	mu         sync.Mutex
 	cfg        config.Config
 	client     *pulsetic.Client
 	writer     *audit.Writer
 	actor      audit.Actor
 	dryRun     bool
-	dryRunOut  io.Writer // where dry-run prints; defaults to os.Stdout
+	out        io.Writer // stdout destination (cobra's OutOrStdout)
 	verbose    bool
-	jsonOutput bool
+	format     string // jsonl, json, csv, stdout
 	quiet      bool
 	records    int    // count of records written (for summary)
 	outputPath string // resolved audit file path (for summary)
 	lastCmd    string // most recent command name (for envelope)
-	jsonData   []json.RawMessage // collected response bodies for --json
+	collected  []json.RawMessage // collected response bodies for json/csv output
 	start      time.Time
 	end        time.Time
 	now        time.Time
@@ -169,19 +192,30 @@ func (o *globalOpts) prepare(version string, dryOut io.Writer) (*runCtx, error) 
 		return nil, fmt.Errorf("until (%s) is before since (%s)", end, start)
 	}
 
+	// Resolve output format. --json is shorthand for --format=json.
+	outFmt := o.format
+	if o.jsonOutput {
+		outFmt = formatJSON
+	}
+	switch outFmt {
+	case formatJSONL, formatJSON, formatCSV, formatStdout:
+	default:
+		return nil, fmt.Errorf("--format: unsupported value %q (use jsonl, json, csv, or stdout)", outFmt)
+	}
+
 	host, _ := os.Hostname()
 	rc := &runCtx{
-		cfg:        cfg,
-		client:     client,
-		actor:      audit.Actor{Tool: "pulsetic-cli", Version: version, Host: host},
-		dryRun:     o.dryRun,
-		dryRunOut:  dryOut,
-		verbose:    o.verbose && !o.quiet,
-		jsonOutput: o.jsonOutput,
-		quiet:      o.quiet,
-		start:      start,
-		end:        end,
-		now:        now,
+		cfg:     cfg,
+		client:  client,
+		actor:   audit.Actor{Tool: "pulsetic-cli", Version: version, Host: host},
+		dryRun:  o.dryRun,
+		out:     dryOut,
+		verbose: o.verbose && !o.quiet,
+		format:  outFmt,
+		quiet:   o.quiet,
+		start:   start,
+		end:     end,
+		now:     now,
 	}
 
 	if !o.dryRun {
@@ -197,32 +231,49 @@ func (o *globalOpts) prepare(version string, dryOut io.Writer) (*runCtx, error) 
 	return rc, nil
 }
 
-// record writes one Call to the audit log. In --dry-run mode it prints
-// the raw response body to the configured dryRunOut writer instead.
-// When --json is active, response bodies are collected for the envelope.
+// record writes one Call to the audit log and emits output per --format.
+// json and csv formats collect bodies for deferred output in close().
+// jsonl and stdout formats emit each response immediately.
 func (rc *runCtx) record(command string, call *pulsetic.Call) error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
 	rc.lastCmd = command
 
-	// Collect response body for --json envelope.
-	if rc.jsonOutput {
-		body := json.RawMessage(call.Body)
-		if len(body) == 0 {
-			body = json.RawMessage("null")
-		}
-		rc.jsonData = append(rc.jsonData, body)
+	out := rc.out
+	if out == nil {
+		out = os.Stdout
 	}
 
+	body := json.RawMessage(call.Body)
+	if len(body) == 0 {
+		body = json.RawMessage("null")
+	}
+
+	// Collect for deferred output (json envelope and csv).
+	if rc.format == formatJSON || rc.format == formatCSV {
+		rc.collected = append(rc.collected, body)
+	}
+
+	// Immediate stdout output for dry-run in jsonl/stdout modes.
 	if rc.writer == nil {
-		// Dry-run: print raw JSON to stdout unless --json handles it.
-		if !rc.jsonOutput {
-			out := rc.dryRunOut
-			if out == nil {
-				out = os.Stdout
-			}
+		rc.records++
+		switch rc.format {
+		case formatJSONL:
 			_, err := fmt.Fprintln(out, string(call.Body))
 			return err
+		case formatStdout:
+			var pretty bytes.Buffer
+			if err := json.Indent(&pretty, call.Body, "", "  "); err != nil {
+				_, err = fmt.Fprintln(out, string(call.Body))
+				return err
+			}
+			_, err := fmt.Fprintln(out, pretty.String())
+			return err
+		case formatJSON, formatCSV:
+			// Deferred - emitted in close().
+			return nil
 		}
-		return nil
 	}
 	// Normalize nil query map to empty so canonical JSON is always "query:{}"
 	// rather than sometimes "query:null". Without this, the same logical
@@ -240,17 +291,20 @@ func (rc *runCtx) record(command string, call *pulsetic.Call) error {
 	// Normalize empty response bodies to JSON null. Some Pulsetic endpoints
 	// (e.g. /downtime with no downtime) return HTTP 200 with a 0-byte body,
 	// which is not valid JSON and would crash json.Marshal on RawMessage.
-	body := json.RawMessage(call.Body)
-	if len(body) == 0 {
-		body = json.RawMessage("null")
+	auditBody := json.RawMessage(call.Body)
+	if len(auditBody) == 0 {
+		auditBody = json.RawMessage("null")
 	}
 	resp := audit.Response{
 		Status:     call.Status,
 		DurationMS: call.DurationMS,
 		BodySHA256: call.BodySHA256,
-		Body:       body,
+		Body:       auditBody,
 	}
 	_, err := rc.writer.Append(command, req, resp)
+	if err == nil {
+		rc.records++
+	}
 	return err
 }
 
@@ -290,7 +344,6 @@ func (rc *runCtx) callAndRecordWithBody(ctx context.Context, command, method, pa
 	if err := rc.record(command, call); err != nil {
 		return nil, err
 	}
-	rc.records++
 	return call, nil
 }
 
@@ -301,24 +354,17 @@ func (rc *runCtx) logStderr(format string, args ...any) {
 	}
 }
 
+func (rc *runCtx) stdout() io.Writer {
+	if rc.out != nil {
+		return rc.out
+	}
+	return os.Stdout
+}
+
 func (rc *runCtx) close() error {
-	// Emit JSON envelope if --json is active.
-	if rc.jsonOutput {
-		out := rc.dryRunOut
-		if out == nil {
-			out = os.Stdout
-		}
-		env := jsonEnvelope{
-			OK:      true,
-			Command: rc.lastCmd,
-			Records: rc.records,
-			Data:    rc.jsonData,
-		}
-		enc := json.NewEncoder(out)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(env); err != nil {
-			return fmt.Errorf("json output: %w", err)
-		}
+	// Emit deferred output for json and csv formats.
+	if err := rc.flushFormat(); err != nil {
+		return err
 	}
 
 	if !rc.quiet {
@@ -334,15 +380,130 @@ func (rc *runCtx) close() error {
 	return rc.writer.Close()
 }
 
-// closeWithError emits a JSON error envelope (for --json mode) and
-// closes the writer. Used by commands that want to report errors
-// in the JSON output instead of only via the exit code.
-func (rc *runCtx) closeWithError(cmdErr error) error {
-	if rc.jsonOutput && cmdErr != nil {
-		out := rc.dryRunOut
-		if out == nil {
-			out = os.Stdout
+// flushFormat writes collected response data to stdout in the requested
+// format. Called by close() for json and csv which defer output until
+// all API calls are done.
+func (rc *runCtx) flushFormat() error {
+	out := rc.stdout()
+
+	switch rc.format {
+	case formatJSON:
+		env := jsonEnvelope{
+			OK:      true,
+			Command: rc.lastCmd,
+			Records: rc.records,
+			Data:    rc.collected,
 		}
+		enc := json.NewEncoder(out)
+		enc.SetEscapeHTML(false)
+		return enc.Encode(env)
+
+	case formatCSV:
+		return rc.writeCSV(out)
+	}
+	return nil
+}
+
+// writeCSV flattens collected JSON response bodies into CSV rows.
+// It extracts items from each response's "data" array (or treats the
+// response as a single object). Column headers are auto-detected from
+// the first item's keys, sorted alphabetically.
+func (rc *runCtx) writeCSV(out io.Writer) error {
+	// Gather all items across all collected pages.
+	var rows []map[string]any
+	for _, raw := range rc.collected {
+		items := extractItems(raw)
+		for _, item := range items {
+			var m map[string]any
+			if err := json.Unmarshal(item, &m); err != nil {
+				continue
+			}
+			rows = append(rows, m)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	// Build sorted column headers from the first row.
+	colSet := map[string]bool{}
+	for k := range rows[0] {
+		colSet[k] = true
+	}
+	cols := make([]string, 0, len(colSet))
+	for k := range colSet {
+		cols = append(cols, k)
+	}
+	sort.Strings(cols)
+
+	w := csv.NewWriter(out)
+	if err := w.Write(cols); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		record := make([]string, len(cols))
+		for i, col := range cols {
+			record[i] = flattenValue(row[col])
+		}
+		if err := w.Write(record); err != nil {
+			return err
+		}
+	}
+	w.Flush()
+	return w.Error()
+}
+
+// extractItems pulls individual objects from a JSON response. It handles
+// both {"data":[...]} envelopes and bare arrays. Single objects are
+// returned as a one-element slice.
+func extractItems(raw json.RawMessage) []json.RawMessage {
+	// Try {"data":[...]} envelope.
+	var env struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && env.Data != nil {
+		return env.Data
+	}
+	// Try bare array.
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr
+	}
+	// Single object.
+	return []json.RawMessage{raw}
+}
+
+// flattenValue converts a JSON value to a CSV-safe string. Nested objects
+// and arrays are serialized as compact JSON strings.
+func flattenValue(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case float64:
+		if val == float64(int64(val)) {
+			return strconv.FormatInt(int64(val), 10)
+		}
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(val)
+	default:
+		// Nested object or array - serialize as JSON.
+		b, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Sprint(val)
+		}
+		return string(b)
+	}
+}
+
+// closeWithError emits an error envelope (for --format=json) and
+// closes the writer.
+func (rc *runCtx) closeWithError(cmdErr error) error {
+	if rc.format == formatJSON && cmdErr != nil {
+		out := rc.stdout()
 		env := jsonEnvelope{
 			OK:      false,
 			Command: rc.lastCmd,
@@ -425,4 +586,41 @@ func readJSONInput(data string, required bool) ([]byte, error) {
 //	?start_dt=2021-01-03+14:00:00
 func formatPulseticTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// matchesFilter checks whether a JSON object matches the --filter string.
+// It does a case-insensitive substring search across common fields:
+// url, name, domain, status, title.
+func matchesFilter(raw json.RawMessage, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	f := strings.ToLower(filter)
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	for _, key := range []string{"url", "name", "domain", "status", "title"} {
+		if v, ok := m[key]; ok && v != nil {
+			if strings.Contains(strings.ToLower(fmt.Sprint(v)), f) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// filterItems applies --filter to a slice of JSON items, returning
+// only those that match. Returns all items if filter is empty.
+func filterItems(items []json.RawMessage, filter string) []json.RawMessage {
+	if filter == "" {
+		return items
+	}
+	var out []json.RawMessage
+	for _, item := range items {
+		if matchesFilter(item, filter) {
+			out = append(out, item)
+		}
+	}
+	return out
 }

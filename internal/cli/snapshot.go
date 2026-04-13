@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/program-the-brain-not-the-heartbeat/pulsetic-cli/internal/pulsetic"
 )
@@ -21,7 +22,8 @@ const snapshotPerPage = 100
 const maxPages = 1000
 
 func newSnapshotCmd(opts *globalOpts, version string) *cobra.Command {
-	return &cobra.Command{
+	var concurrency int
+	cmd := &cobra.Command{
 		Use:   "snapshot",
 		Short: "Capture a full audit snapshot across monitors, incidents, and status pages",
 		Long: "Walks all monitors, status pages, domains, and heartbeats, recording each\n" +
@@ -32,7 +34,9 @@ func newSnapshotCmd(opts *globalOpts, version string) *cobra.Command {
 
   # Custom time range
   pulsetic-cli snapshot --since=7d
-  pulsetic-cli snapshot --since=2026-04-01T00:00:00Z --until=2026-04-07T00:00:00Z
+
+  # Faster with concurrent API calls
+  pulsetic-cli snapshot --concurrency=10
 
   # Preview what would be captured without writing audit records
   pulsetic-cli snapshot --dry-run
@@ -45,26 +49,42 @@ func newSnapshotCmd(opts *globalOpts, version string) *cobra.Command {
 				return err
 			}
 			defer rc.close()
-			return runSnapshot(c.Context(), rc)
+			return runSnapshot(c.Context(), rc, concurrency)
 		},
 	}
+	cmd.Flags().IntVar(&concurrency, "concurrency", 5, "number of parallel API workers for per-monitor calls")
+	return cmd
 }
 
-func runSnapshot(ctx context.Context, rc *runCtx) error {
-	rc.logStderr("snapshot: %s to %s\n",
-		formatPulseticTime(rc.start), formatPulseticTime(rc.end))
+func runSnapshot(ctx context.Context, rc *runCtx, concurrency int) error {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	rc.logStderr("snapshot: %s to %s (concurrency=%d)\n",
+		formatPulseticTime(rc.start), formatPulseticTime(rc.end), concurrency)
 
-	// 1. Monitors + per-monitor history.
+	// 1. Monitors + per-monitor history (concurrent).
 	monitorIDs, err := listAllMonitors(ctx, rc, "snapshot.monitors.list")
 	if err != nil {
 		return fmt.Errorf("list monitors: %w", err)
 	}
 	rc.logStderr("snapshot: %d monitors found\n", len(monitorIDs))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+	total := len(monitorIDs)
 	for i, id := range monitorIDs {
-		rc.logStderr("  monitor %d/%d (id=%d)\n", i+1, len(monitorIDs), id)
-		if err := captureMonitorHistory(ctx, rc, id, "snapshot.monitors"); err != nil {
-			return fmt.Errorf("monitor %d: %w", id, err)
-		}
+		i, id := i, id
+		g.Go(func() error {
+			rc.logStderr("  monitor %d/%d (id=%d)\n", i+1, total, id)
+			if err := captureMonitorHistory(gctx, rc, id, "snapshot.monitors"); err != nil {
+				return fmt.Errorf("monitor %d: %w", id, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// 2. Status pages + incidents.

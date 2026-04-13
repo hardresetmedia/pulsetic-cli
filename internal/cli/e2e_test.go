@@ -1034,3 +1034,103 @@ func TestJSONOutputIsPipelineCompatible(t *testing.T) {
 		t.Fatalf("expected example.com, got %v", domain["domain"])
 	}
 }
+
+// ---------- --format flag ----------
+
+func TestFormatJSONL(t *testing.T) {
+	// Default format: each API response body printed as one JSONL line.
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should have at least one line of JSON on stdout.
+	lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+	if len(lines) < 1 || lines[0] == "" {
+		t.Fatalf("expected JSONL output, got: %q", res.Stdout)
+	}
+	// Each line should be valid JSON.
+	for i, line := range lines {
+		var v any
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			t.Fatalf("line %d not valid JSON: %v\nline: %s", i, err, line)
+		}
+	}
+}
+
+func TestFormatStdoutPrettyPrints(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "get", "42", "--format=stdout", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pretty-printed JSON should have newlines and indentation.
+	if !strings.Contains(res.Stdout, "\n  ") {
+		t.Fatalf("expected indented JSON, got: %s", res.Stdout)
+	}
+}
+
+func TestFormatCSV(t *testing.T) {
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "domains", "list", "--format=csv", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected CSV header + at least 1 row, got %d lines:\n%s", len(lines), res.Stdout)
+	}
+	// First line is the header.
+	header := lines[0]
+	if !strings.Contains(header, "domain") {
+		t.Fatalf("CSV header should contain 'domain', got: %s", header)
+	}
+	// Second line is data.
+	if !strings.Contains(lines[1], "example.com") {
+		t.Fatalf("CSV row should contain 'example.com', got: %s", lines[1])
+	}
+}
+
+func TestFormatCSVEmptyResponse(t *testing.T) {
+	// When the API returns no items, CSV should produce no output (no header).
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "heartbeats", "get", "99", "--format=csv", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The crudServer returns a single object (not an array) for get endpoints.
+	// extractItems wraps it as a 1-element slice, so we should get a header + 1 row.
+	if strings.TrimSpace(res.Stdout) == "" {
+		t.Fatal("expected CSV output for single object response")
+	}
+}
+
+func TestFormatJSONIsEnvelope(t *testing.T) {
+	// --format=json should produce the same envelope as --json.
+	srv := newCrudServer(t)
+	res, err := runCmdSplit(t, srv, "monitors", "list", "--format=json", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env jsonEnvelope
+	if err := json.Unmarshal([]byte(res.Stdout), &env); err != nil {
+		t.Fatalf("not a valid JSON envelope: %v\nstdout: %s", err, res.Stdout)
+	}
+	if !env.OK {
+		t.Fatal("expected ok=true")
+	}
+	if env.Records < 1 {
+		t.Fatalf("expected at least 1 record, got %d", env.Records)
+	}
+}
+
+func TestFormatInvalid(t *testing.T) {
+	srv := newCrudServer(t)
+	_, err := runCmdSplit(t, srv, "monitors", "list", "--format=xml", "--dry-run")
+	if err == nil {
+		t.Fatal("expected error for unsupported format")
+	}
+	if !strings.Contains(err.Error(), "unsupported value") {
+		t.Fatalf("error should mention unsupported value, got: %v", err)
+	}
+}

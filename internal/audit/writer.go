@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-// Writer appends hash-chained records to a JSONL audit file. It is not
-// safe for concurrent use; pulsetic-cli drives it from a single goroutine.
+// Writer appends hash-chained records to a JSONL audit file. It is safe
+// for concurrent use - a mutex serializes Append calls so the hash chain
+// remains valid regardless of goroutine scheduling order.
 type Writer struct {
+	mu       sync.Mutex
 	f        *os.File
 	w        *bufio.Writer
 	actor    Actor
@@ -54,6 +57,8 @@ func OpenWriter(path string, actor Actor, now func() time.Time) (*Writer, error)
 // updates the chain state, and flushes the buffer so partial runs
 // still produce a durable trail.
 func (w *Writer) Append(command string, req Request, resp Response) (Record, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	r := Record{
 		Seq:      w.seq,
 		TS:       w.now().UTC().Format(time.RFC3339Nano),
@@ -88,6 +93,8 @@ func (w *Writer) Append(command string, req Request, resp Response) (Record, err
 
 // Close flushes buffered data, fsyncs the file, and closes it.
 func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if err := w.w.Flush(); err != nil {
 		_ = w.f.Close()
 		return fmt.Errorf("audit: flush: %w", err)

@@ -38,7 +38,7 @@ func newVerifyCmd(opts *globalOpts) *cobra.Command {
 
 			out := c.OutOrStdout()
 
-			if opts.jsonOutput {
+			if opts.jsonOutput || opts.format == "json" {
 				v := map[string]any{
 					"ok":        res.OK(),
 					"records":   res.Records,

@@ -259,9 +259,36 @@ The API token is env-only (`PULSETIC_API_TOKEN`).
 |---|---|
 | `--config` | Path to TOML config file |
 | `--output` | Override output directory |
+| `--format` | Output format: `jsonl` (default), `json`, `csv`, `stdout` |
+| `--json` | Shorthand for `--format=json` |
 | `--since` | Time range start (e.g. `24h`, `7d`, `2026-04-01T00:00:00Z`) |
 | `--until` | Time range end (default: now) |
 | `--dry-run` | Print API responses to stdout, don't write audit records |
+| `-v`, `--verbose` | Log each API call to stderr |
+| `-q`, `--quiet` | Suppress all stderr progress output |
+
+### Output formats
+
+| Format | Description |
+|---|---|
+| `jsonl` | One JSON object per API response, one per line (default). Pipe-friendly with `jq`. |
+| `json` | Single JSON envelope: `{ok, command, records, data:[...]}`. Best for scripting. |
+| `csv` | Flattened CSV with auto-detected columns from response data. Best for spreadsheets. |
+| `stdout` | Pretty-printed JSON with indentation. Best for human reading. |
+
+```bash
+# Default JSONL - one response per line
+pulsetic-cli monitors list --dry-run
+
+# Pretty-printed for reading
+pulsetic-cli monitors get 4172 --format=stdout --dry-run
+
+# CSV for spreadsheets or awk
+pulsetic-cli monitors list --format=csv --dry-run
+
+# JSON envelope for scripting
+pulsetic-cli monitors list --format=json --dry-run | jq '.data[0].data[].id'
+```
 
 ## Commands
 
