@@ -4,6 +4,8 @@ A Go CLI that queries [Pulsetic's API](https://pulsetic.com) and records every r
 
 Every API call the tool makes - read or write - produces a tamper-detectable audit record.
 
+> **Disclaimer:** This is an unofficial, community-built tool. It is **not** affiliated with, endorsed by, supported by, or sponsored by Pulsetic or any of its employees. "Pulsetic" is the name of the third-party service this CLI interacts with via its public API. All trademarks belong to their respective owners. Use at your own risk.
+
 ## Install
 
 ```bash
